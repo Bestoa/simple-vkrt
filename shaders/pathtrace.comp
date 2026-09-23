@@ -1,0 +1,311 @@
+#version 450
+// ============================================================================
+// Engine-mode Cornell Box path tracer: mesh assets + data-driven materials.
+// Pure compute, no ray tracing extensions. Static rendering via progressive
+// accumulation (1 spp/frame). NEE samples emissive triangles directly.
+//
+// Scene data comes from OBJ/MTL assets placed by a scene file (see assets/):
+//   tris      — triangle soup (v0, e1, e2, normal+material index)
+//   nodes     — binned-SAH BVH built on the CPU
+//   mats      — material array (albedo/emission/type/ior)
+//   lights    — emissive triangles with a normalized CDF for NEE sampling
+// ============================================================================
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform Params {
+    vec4 camPos, camRight, camUp, camFwd;
+    vec4 res;                                   // x=w y=h z=accumulated frames w=tan(fov/2)
+} p;
+
+// accumulation: rgb = sum of samples, w = sample count
+layout(std430, set = 0, binding = 1) buffer Accum { vec4 accum[]; };
+// primary-hit G-buffer: xyz = normal, w = depth (edge-stopping for the denoiser)
+layout(std430, set = 0, binding = 7) writeonly buffer GBuf { vec4 gbuf[]; };
+// luminance moments: x = sum L, y = sum L^2, z = count (variance for the denoiser)
+layout(std430, set = 0, binding = 8) buffer Moments { vec4 mom[]; };
+
+struct Tri { vec4 v0, e1, e2, nm;                // nm.xyz = geometric face normal, nm.w = material index
+             vec4 n0, n1, n2; };                  // per-vertex SHADING normals (barycentric-interpolated)
+layout(std430, set = 0, binding = 2) readonly buffer Tris { Tri tris[]; };
+
+struct Node { vec4 bmin, bmax; };               // bmin.w = left child / first tri, bmax.w = tri count
+layout(std430, set = 0, binding = 3) readonly buffer Nodes { Node nodes[]; };
+
+struct Material { vec4 albType;                 // rgb = albedo, w = type (0 diffuse,1 mirror,2 glass,3 light)
+                  vec4 emitIor; };              // rgb = emission, w = IOR
+layout(std430, set = 0, binding = 4) readonly buffer Mats { Material mats[]; };
+
+struct LightTri { vec4 data; };                 // x = tri index, y = cumulative pdf (CDF), z = area
+layout(std430, set = 0, binding = 5) readonly buffer Lights { LightTri lights[]; };
+
+layout(rgba8, set = 0, binding = 6) writeonly uniform image2D img;
+
+const float INF = 1e30;
+
+// ---------------------------------------------------------------- RNG (PCG)
+uint rngState;
+uint pcg() {
+    rngState = rngState * 747796405u + 2891336453u;
+    uint w = ((rngState >> ((rngState >> 28u) + 4u)) ^ rngState) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+float rnd() { return float(pcg()) * (1.0 / 4294967296.0); }
+
+// ------------------------------------------------------------- intersections
+bool boxT(vec3 bmin, vec3 bmax, vec3 ro, vec3 inv, float tmax) {
+    vec3 t0 = (bmin - ro) * inv;
+    vec3 t1 = (bmax - ro) * inv;
+    vec3 tmin = min(t0, t1), tmx = max(t0, t1);
+    float tn = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
+    float tf = min(min(tmx.x, tmx.y), min(tmx.z, tmax));
+    return tn <= tf;
+}
+float triT(vec3 ro, vec3 rd, vec3 v0, vec3 e1, vec3 e2, out float bu, out float bv) {
+    bu = 0.0; bv = 0.0;
+    vec3 pv = cross(rd, e2);
+    float det = dot(e1, pv);
+    if (det > -1e-9 && det < 1e-9) return -1.0;
+    float inv = 1.0 / det;
+    vec3 tv = ro - v0;
+    float u = dot(tv, pv) * inv;
+    if (u < 0.0 || u > 1.0) return -1.0;
+    vec3 q = cross(tv, e1);
+    float v = dot(rd, q) * inv;
+    if (v < 0.0 || u + v > 1.0) return -1.0;
+    float t = dot(e2, q) * inv;
+    if (t <= 1e-4) return -1.0;
+    bu = u; bv = v;
+    return t;
+}
+
+struct Hit { float t; vec3 n; vec3 gn; vec3 alb; vec3 emit; int type; float ior; };
+// h.n  = interpolated SHADING normal (smooth reflections / glass optics)
+// h.gn = geometric face normal (inside/outside tests)
+
+bool trace(vec3 ro, vec3 rd, out Hit h) {
+    h.t = INF; h.type = -1; h.n = vec3(0.0); h.gn = vec3(0.0);
+    h.alb = vec3(0.0); h.emit = vec3(0.0); h.ior = 1.5;
+    if (nodes.length() == 0) return false;
+    int bestK = -1;
+    float bestT = INF, bestU = 0.0, bestV = 0.0;
+    vec3 inv = 1.0 / rd;
+    int stack[32];
+    int sp = 0;
+    stack[sp++] = 0;
+    while (sp > 0) {
+        int ni = stack[--sp];
+        vec4 bmin = nodes[ni].bmin;
+        vec4 bmax = nodes[ni].bmax;
+        if (bmax.w > 0.5) {                     // leaf
+            int first = int(bmin.w);
+            int cnt = int(bmax.w);
+            for (int k = 0; k < cnt; ++k) {
+                int ti = first + k;
+                Tri tr = tris[ti];
+                float bu, bv;
+                float t = triT(ro, rd, tr.v0.xyz, tr.e1.xyz, tr.e2.xyz, bu, bv);
+                if (t > 0.0 && t < bestT) {
+                    bestT = t; bestK = ti; bestU = bu; bestV = bv;
+                }
+            }
+        } else {                                // internal: children at L, L+1
+            int L = int(bmin.w);
+            if (boxT(nodes[L].bmin.xyz, nodes[L].bmax.xyz, ro, inv, bestT)) stack[sp++] = L;
+            if (boxT(nodes[L + 1].bmin.xyz, nodes[L + 1].bmax.xyz, ro, inv, bestT)) stack[sp++] = L + 1;
+            if (sp > 30) break;
+        }
+    }
+    if (bestK < 0) return false;
+    Tri tr = tris[bestK];
+    Material m = mats[int(tr.nm.w + 0.5)];
+    h.t = bestT;
+    h.gn = normalize(tr.nm.xyz);
+    h.n = normalize((1.0 - bestU - bestV) * tr.n0.xyz + bestU * tr.n1.xyz + bestV * tr.n2.xyz);
+    h.alb = m.albType.rgb;
+    h.emit = m.emitIor.rgb;
+    h.type = int(m.albType.w + 0.5);
+    h.ior = m.emitIor.w;
+    return true;
+}
+
+// ------------------------------------------------------------------ sampling
+vec3 cosineDir(vec3 n) {
+    float u1 = rnd(), u2 = rnd();
+    float phi = 6.28318530718 * u1;
+    float r = sqrt(u2);
+    vec3 t = normalize(abs(n.y) < 0.99 ? cross(vec3(0, 1, 0), n) : cross(vec3(1, 0, 0), n));
+    vec3 b = cross(n, t);
+    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u2)));
+}
+vec3 faceN(vec3 n, vec3 rd) { return dot(n, rd) < 0.0 ? n : -n; }
+
+// NEE: sample one emissive triangle (area-weighted CDF) and shade it.
+// Shadow rays PASS THROUGH glass (straight-through transmission approximation,
+// (1-Fresnel) per interface, tinted by albedo) — this gives a soft caustic-style
+// glow under glass instead of a black umbra, and removes that noise source.
+vec3 sampleLightNEE(vec3 P, vec3 n) {
+    if (lights.length() == 0) return vec3(0.0);
+    // binary-search the CDF
+    float u = rnd() * lights[lights.length() - 1].data.y;
+    int lo = 0, hi = lights.length() - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (lights[mid].data.y < u) lo = mid + 1;
+        else hi = mid;
+    }
+    Tri t = tris[int(lights[lo].data.x)];
+    // uniform point on triangle via barycentrics
+    float r1 = rnd(), r2 = rnd();
+    float a = 1.0 - sqrt(r1), b = sqrt(r1) * (1.0 - r2), c = sqrt(r1) * r2;
+    vec3 v0 = t.v0.xyz, v1 = v0 + t.e1.xyz, v2 = v0 + t.e2.xyz;
+    vec3 lp = a * v0 + b * v1 + c * v2;
+    vec3 nL = normalize(cross(t.e1.xyz, t.e2.xyz));
+    float area = lights[lo].data.z;
+
+    vec3 L = lp - P;
+    float d2 = dot(L, L);
+    float d = sqrt(d2);
+    vec3 wi = L / d;
+    float cosL = abs(dot(nL, wi));              // double-sided light
+    float cosP = dot(n, wi);
+    if (cosL <= 1e-6 || cosP <= 0.0) return vec3(0.0);
+
+    // transmissive shadow ray: opaque hit blocks, glass lets it through
+    vec3 trans = vec3(1.0);
+    vec3 o = P + n * 1e-4;
+    float dist = d;
+    for (int s = 0; s < 4; ++s) {
+        Hit h;
+        if (!trace(o, wi, h)) return vec3(0.0);
+        if (h.t >= dist - 2e-3) break;          // reached the light surface
+        if (h.type != 2) return vec3(0.0);      // opaque occluder
+        float f0 = (h.ior - 1.0) / (h.ior + 1.0);
+        f0 *= f0;
+        float ci = abs(dot(wi, normalize(h.n)));
+        float fr = f0 + (1.0 - f0) * pow(1.0 - ci, 5.0);
+        trans *= (1.0 - fr) * h.alb * 0.85;     // ~one interface pair per pane
+        dist -= h.t;
+        o = o + wi * (h.t + 1e-3);
+    }
+    float pdf = d2 / (cosL * area);             // solid-angle pdf
+    return mats[int(t.nm.w + 0.5)].emitIor.rgb * (cosP / pdf) * trans;
+}
+
+// ---------------------------------------------------------------- path trace
+vec3 render(vec3 ro, vec3 rd, out float primT, out vec3 primN) {
+    vec3 rad = vec3(0.0), thr = vec3(1.0);
+    primT = 1e6;                       // "miss" depth for the G-buffer
+    primN = vec3(0.0, 1.0, 0.0);
+    bool spec = true;  // emission visible directly only from camera/specular chain
+    for (int bounce = 0; bounce < 6; ++bounce) {
+        Hit h;
+        if (!trace(ro, rd, h)) break;
+        vec3 pos = ro + rd * h.t;
+        if (bounce == 0) { primT = h.t; primN = faceN(h.n, rd); }
+
+        if (h.type == 3) {                      // emissive
+            if (spec) rad += thr * h.emit;
+            break;
+        }
+        if (h.type == 1) {                      // mirror
+            vec3 n = faceN(h.n, rd);
+            thr *= h.alb;
+            rd = reflect(rd, n);
+            ro = pos + n * 1e-4;
+            spec = true;
+            continue;
+        }
+        if (h.type == 2) {                      // glass
+            bool entering = dot(rd, h.gn) < 0.0;   // geometric normal: inside/outside test
+            vec3 n = entering ? h.n : -h.n;        // smooth shading normal for optics
+            float eta = entering ? (1.0 / h.ior) : h.ior;
+            float cosi = clamp(-dot(rd, n), 0.0, 1.0);
+            float k = 1.0 - eta * eta * (1.0 - cosi * cosi);
+            if (k < 0.0) {
+                rd = reflect(rd, n);            // total internal reflection
+            } else {
+                // Schlick with the INCIDENCE-side angle (the dense-medium angle
+                // when exiting) — using the refracted angle here over-estimates
+                // reflectance and makes glass look like metal.
+                float f0 = (h.ior - 1.0) / (h.ior + 1.0);
+                f0 *= f0;
+                float fr = f0 + (1.0 - f0) * pow(1.0 - cosi, 5.0);
+                if (rnd() < fr) rd = reflect(rd, n);
+                else {
+                    rd = normalize(eta * rd + (eta * cosi - sqrt(k)) * n);
+                    thr *= h.alb;               // tint on transmission
+                }
+            }
+            ro = pos + rd * 1e-4;
+            spec = false;   // caustic energy comes from the transmissive NEE shadow;
+            continue;       // counting light seen through glass here too = double counting + fireflies
+        }
+        // diffuse: direct light (NEE) + cosine-weighted indirect.
+        // First bounce gets 4 light samples — the camera-visible surfaces
+        // dominate perceived noise (penumbra edges especially).
+        vec3 n = faceN(h.n, rd);
+        {
+            int S = (bounce == 0) ? 4 : 1;
+            vec3 direct = vec3(0.0);
+            for (int s = 0; s < S; ++s) direct += sampleLightNEE(pos + n * 1e-4, n);
+            rad += thr * h.alb * (direct / float(S));
+        }
+        thr *= h.alb;
+        rd = cosineDir(n);
+        ro = pos + n * 1e-4;
+        spec = false;
+    }
+    return rad;
+}
+
+vec3 aces(vec3 x) {
+    return clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+void main() {
+    ivec2 pid = ivec2(gl_GlobalInvocationID.xy);
+    int w = int(p.res.x);
+    int h = int(p.res.y);
+    if (pid.x >= w || pid.y >= h) return;
+
+    rngState = (uint(pid.y) * uint(w) + uint(pid.x)) * 9781u + uint(p.res.z) * 6271u + 1u;
+    pcg();
+
+    float aspect = float(w) / float(h);
+    float px = (2.0 * (float(pid.x) + rnd()) / float(w) - 1.0) * aspect * p.res.w;
+    float py = (1.0 - 2.0 * (float(pid.y) + rnd()) / float(h)) * p.res.w;
+    vec3 rd = normalize(p.camFwd.xyz + px * p.camRight.xyz + py * p.camUp.xyz);
+
+    float primT;
+    vec3 primN;
+    vec3 col = clamp(render(p.camPos.xyz, rd, primT, primN), vec3(0.0), vec3(48.0));
+
+    uint idx = uint(pid.y) * uint(w) + uint(pid.x);
+    // running mean (Welford-style): magnitudes stay bounded, so accumulation
+    // never stalls from fp32 rounding — samples forever until the camera moves
+    vec4 a = accum[idx];
+    if (p.res.z < 0.5) {
+        a = vec4(col, 1.0);
+    } else {
+        float n = a.w;
+        a.rgb += (col - a.rgb) / (n + 1.0);
+        a.w = n + 1.0;
+    }
+    accum[idx] = a;
+
+    float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    vec4 m = mom[idx];
+    if (p.res.z < 0.5) {
+        m = vec4(luma, luma * luma, 1.0, 0.0);
+    } else {
+        float n = m.z;
+        m.x += (luma - m.x) / (n + 1.0);
+        m.y += (luma * luma - m.y) / (n + 1.0);
+        m.z = n + 1.0;
+    }
+    mom[idx] = m;
+    gbuf[idx] = vec4(primN, primT);
+
+    vec3 disp = pow(aces(a.rgb), vec3(1.0 / 2.2));   // a.rgb is already the mean
+    imageStore(img, pid, vec4(disp, 1.0));
+}

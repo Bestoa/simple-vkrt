@@ -1,0 +1,23 @@
+#version 450
+// ============================================================================
+// Final tonemap pass: filtered mean radiance -> ACES + gamma -> display image.
+// (Used when offline denoising is enabled; otherwise pathtrace.comp already
+// writes the display image directly.)
+// ============================================================================
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform Res { ivec2 res; } r;
+layout(std430, set = 0, binding = 1) readonly buffer Cin { vec4 cin[]; };
+layout(rgba8, set = 0, binding = 2) writeonly uniform image2D img;
+
+vec3 aces(vec3 x) {
+    return clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+void main() {
+    ivec2 pid = ivec2(gl_GlobalInvocationID.xy);
+    if (pid.x >= r.res.x || pid.y >= r.res.y) return;
+    uint idx = uint(pid.y) * uint(r.res.x) + uint(pid.x);
+    vec3 disp = pow(aces(cin[idx].rgb), vec3(1.0 / 2.2));
+    imageStore(img, pid, vec4(disp, 1.0));
+}

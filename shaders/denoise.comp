@@ -1,0 +1,72 @@
+#version 450
+// ============================================================================
+// Offline variance-guided à-trous denoiser (static output only).
+// Runs once on the converged mean image before the final tonemap:
+//  - edge-stopping weights from the G-buffer (normal + depth)
+//  - variance-of-mean per pixel from the accumulated luminance moments
+//    (noisy dark areas get smoothed, converged bright areas stay untouched)
+//  - 5 iterations with exponentially growing steps (1,2,4,8,16), ping-pong
+//    between the accumulation buffer and the scratch buffer
+// ============================================================================
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform PC { ivec4 cfg; } pc;   // x = step, y = 1 on first iteration
+
+layout(set = 0, binding = 0) uniform Res { ivec2 res; } r;
+layout(std430, set = 0, binding = 1) readonly buffer GBuf { vec4 gbuf[]; };   // xyz normal, w depth
+layout(std430, set = 0, binding = 2) readonly buffer Mom  { vec4 mom[]; };    // sumL, sumL2, count
+layout(std430, set = 0, binding = 3) readonly buffer Cin  { vec4 cin[]; };    // rgb mean, w = var (propagated)
+layout(std430, set = 0, binding = 4) writeonly buffer Cout { vec4 cout[]; }; // rgb filtered, w = var
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+void main() {
+    ivec2 pid = ivec2(gl_GlobalInvocationID.xy);
+    if (pid.x >= r.res.x || pid.y >= r.res.y) return;
+    int w = r.res.x;
+    uint idx = uint(pid.y) * uint(w) + uint(pid.x);
+
+    vec4 g0 = gbuf[idx];
+    vec3 n0 = g0.xyz;
+    float d0 = g0.w;
+    vec4 c0 = cin[idx];   // accumulator already holds the running MEAN
+    float l0 = dot(c0.rgb, LUMA);
+
+    // variance of the running mean: on the FIRST iteration derive it from the
+    // luminance moments (E[L], E[L^2], N); afterwards use the propagated w channel
+    float v0;
+    if (pc.cfg.y != 0) {
+        vec4 m = mom[idx];
+        float n = max(m.z, 1.0);
+        v0 = max(m.y - m.x * m.x, 0.0) / n;
+    } else {
+        v0 = c0.w;
+    }
+
+    vec3 acc = c0.rgb;
+    float wsum = 1.0;
+    float w2sum = 1.0;
+
+    int s = pc.cfg.x;
+    const ivec2 offs[4] = ivec2[4](ivec2(s, 0), ivec2(-s, 0), ivec2(0, s), ivec2(0, -s));
+    for (int k = 0; k < 4; ++k) {
+        ivec2 q = pid + offs[k];
+        if (q.x < 0 || q.y < 0 || q.x >= r.res.x || q.y >= r.res.y) continue;
+        uint tidx = uint(q.y) * uint(w) + uint(q.x);
+        vec4 g1 = gbuf[tidx];
+        vec4 c1 = cin[tidx];
+
+        float wn = pow(max(dot(n0, g1.xyz), 0.0), 32.0);                     // normal weight
+        float wd = exp(-abs(g1.w - d0) / (0.05 * d0 + 1e-4));                // depth weight
+        float dv = max(v0, 1e-4);
+        float dl = l0 - dot(c1.rgb, LUMA);
+        float wl = dv / (dv + dl * dl);                                      // variance weight
+        float wt = 0.5 * wn * wd * wl;
+        if (wt > 0.0) {
+            acc += c1.rgb * wt;
+            wsum += wt;
+            w2sum += wt * wt;
+        }
+    }
+    cout[idx] = vec4(acc / wsum, v0 * (w2sum / (wsum * wsum)));
+}

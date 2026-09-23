@@ -1,0 +1,17 @@
+# build artifacts
+build/
+cmake-build-*/
+
+# rendered outputs (regenerable)
+out.png
+snapshot.png
+*.ppm
+*.exr
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+
+# Vulkan tools
+vkconfig-*.json

@@ -1,0 +1,11 @@
+# scene format (one entity per line):
+#   mesh.obj  px py pz  rotYdeg  sx sy sz  material
+#   sphere    cx cy cz  radius            material
+#   material: auto | diffuse r g b | light r g b | mirror r g b | glass r g b ior
+# 'auto' = use the OBJ's own MTL materials. Mesh paths are relative to this file.
+# 'sphere' is a native engine primitive (tessellated internally with smooth normals).
+cornell_room.obj   0 0 0       0   1 1 1        auto
+unit_box.obj      -1.08 0.99 -0.35  18   1.06 1.98 1.06  auto
+unit_box.obj       1.25 0.53  0.35 -15   1.06 1.06 1.06  auto
+sphere_user.obj 0 0.68 1.70 0 0.68 0.68 0.68 glass 1 1 1 1.5
+sphere_flipped.obj 1.5 0.5 1.60 0 0.5 0.5 0.5 mirror 0.95 0.95 0.96
