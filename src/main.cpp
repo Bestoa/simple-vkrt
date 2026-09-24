@@ -399,8 +399,8 @@ struct BVHBuilder {
             mid = splitMedian();
         } else {
             float thresh = lo + (bestSplit + 1) / k1;
-            int* beg = &indices[first];
-            int* end = &indices[first + count];
+            int* beg = indices.data() + first;
+            int* end = beg + count;
             int* midp = std::partition(beg, end, [&](int i) { return AX(i) < thresh; });
             mid = (int)(midp - beg);
             if (mid == 0 || mid == count) mid = splitMedian();
