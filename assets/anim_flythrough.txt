@@ -1,0 +1,23 @@
+# camera animation: one key per line
+#   t  px py pz  tx ty tz      (seconds, camera position, look-at target)
+# Catmull-Rom interpolated (C1 smooth). Track: approach the Cornell box,
+# fly in, FAST u-turn mid-room onto the METAL BALL, exit past the glass
+# sphere while staying locked on the metal ball, then return to default.
+#
+# -- approach (outside)
+0.00   0.00 2.75 11.50    0.00 2.50  0.00
+1.70   0.00 2.55  5.60    0.00 2.50  0.00
+# -- enter through the front opening (above the glass sphere)
+2.80   0.00 2.45  1.50    0.00 2.35 -0.80
+3.50   0.00 2.42  0.55    0.00 2.30 -2.20    # shallow mid-room, facing the back wall
+# -- FAST u-turn (~0.9s): look sweeps via the red wall straight onto the metal ball
+4.10   0.10 2.40  0.30   -2.00 2.40  0.10
+4.40   0.20 2.40  0.60    1.50 0.50  1.60    # locked on the metal ball
+# -- descend and exit past the glass sphere, still tracking the metal ball
+5.20   0.45 1.90  0.90    1.50 0.50  1.60
+5.90   0.60 1.62  1.70    1.50 0.50  1.60    # closest pass by the glass sphere
+6.60   1.05 1.95  3.10    1.50 0.50  1.60    # outside, looking back at it
+# -- swing back to the default view
+7.30   1.30 2.40  5.30    0.60 1.60  0.80
+8.00   0.00 2.66  7.998   0.00 2.50  0.00
+8.60   0.00 2.66  7.998   0.00 2.50  0.00    # hold

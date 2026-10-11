@@ -32,6 +32,7 @@ BVH 遍历与全部求交在普通 compute shader 里手写完成;macOS 上经 M
 - **原生球原语**:场景级 `sphere` 关键字,引擎内部网格化,渲染器单管线零特判
 - **实时预览**:交互窗口(拖拽/滚轮/WASD),离屏渲染带实时预览窗 + 进度/ETA
 - **P 键快照**:从当前视角出 4096 spp 无噪成品
+- **相机动画**:关键帧文件(Catmull-Rom)→ 逐帧独立收敛 + 降噪 → PNG 序列
 
 ## 快速开始(macOS)
 
@@ -41,7 +42,8 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 
 ./build/rt                                          # 交互预览,P = 4096 spp 快照
 ./build/rt --offscreen 4096 --size 1920x1080       # 静态渲染(带实时预览)-> out.png
-# 常用: --scene path --ires WxH --snap N --nodenoise --novsync --validate
+./build/rt --anim assets/anim_flythrough.txt --size 1280x720 --spp 96 --out anim
+# 常用: --scene path --ires WxH --snap N --fps 30 --nodenoise --novsync --validate
 ```
 
 ## 场景文件(`assets/scene.txt`)
@@ -60,6 +62,36 @@ sphere             1.5  0.5   1.60  0.5           mirror 0.95 0.95 0.96
 资产由 `assets/gen_assets.py` 生成;任何外部 OBJ(Blender 导出等)放入
 `assets/` 加一行即可。`assets/scene_objtest.txt` 为全网格球对照示例。
 
+## 相机动画(`assets/anim_flythrough.txt`)
+
+![fly-through contact sheet](docs/anim_contact_sheet.png)
+
+*8.6 秒飞越:远景接近 → 浅入盒中 → 0.9 秒快掉头锁定金属球 → 掠过玻璃球出盒 → 退回原始视角。
+1280×720 × 30fps;`--fast` 预览 259 帧约 44 秒,正式渲染按 spp 定(96 spp ≈ 44 分钟,1024 spp 约 4.5 小时)。*
+
+```
+#   t  px py pz  tx ty tz     (秒,相机位置,注视点)
+0.00   0.00 2.75 11.50    0.00 2.50  0.00
+3.80   0.00 2.42 -0.20    0.00 2.30 -2.20    # 盒内中央,面向后墙
+6.60   0.60 1.62  1.70    0.10 0.85  1.45    # 贴着玻璃球擦过
+...
+```
+
+位置与注视点各自走 Catmull-Rom 样条(C1 连续,端点夹持自动缓入缓出)。
+每个输出帧都是独立收敛的成品:设定相机 → 从零累积 N spp → 方差引导降噪
+→ 写 `anim/frame_%04d.png`。渲染过程带实时预览窗,关窗即取消。
+
+```bash
+./build/rt --anim assets/anim_flythrough.txt --size 1280x720 --spp 96 --fps 30 --out anim
+ffmpeg -framerate 30 -i anim/frame_%04d.png -c:v libx264 -pix_fmt yuv420p -crf 18 anim.mp4
+
+# 快速预览(检查运镜,无视噪点):1 spp + 免降噪,283 帧约 1 分钟;加 --ires 640x360 约 20 秒
+./build/rt --anim assets/anim_flythrough.txt --fast --size 1280x720 --out anim_fast
+```
+
+引擎侧相机与输入策略解耦:`setView(pos, look)` 是唯一的视图入口,
+轨道相机、动画样条、未来的外部嵌入方都走同一条代码路径。
+
 ## 渲染管线
 
 ```
@@ -77,6 +109,7 @@ denoise.comp ×5(à-trous 方差引导)→ finalize.comp → PNG
 | 交互预览 1280×720 | ~10 fps,静止持续收敛 |
 | 降噪收益(256 spp vs 2048 参考) | 误差 −41%~−55%,边缘梯度零损失 |
 | 1600×900 × 1024 spp + 降噪 | ~3 分钟 |
+| 动画 1280×720 × 30fps × 96 spp/帧 | 283 帧 53 分钟(7.9 Mpaths/s 均值) |
 
 ## 已知边界
 

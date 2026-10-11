@@ -7,6 +7,9 @@
 //   build:  cmake -B build && cmake --build build -j
 //   run:    ./build/rt                          interactive preview (drag/WASD/scroll)
 //           ./build/rt --offscreen 2048 --size 1920x1080   -> out.png
+//           ./build/rt --anim assets/anim_flythrough.txt --size 1280x720 \
+//                     --spp 128 --fps 30 --out anim        -> anim/frame_%04d.png
+//           (add --fast for a noisy 1-spp motion preview, ~30-60s for 283 frames)
 //           options: --scene path --size WxH --ires WxH --validate --novsync
 //
 // Engine data flow:
@@ -25,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -294,6 +298,44 @@ static bool loadScene(const std::string& path, std::vector<Entity>& entities) {
     return !entities.empty();
 }
 
+// ------------------------------------------------------------------ anim file
+// Camera keyframes for fly-through rendering: one line per key,
+//   t  px py pz  tx ty tz      (camera position, look-at target; seconds)
+// Position and target are interpolated with Catmull-Rom splines (C1 smooth,
+// endpoints duplicated so the path eases out of the first / into the last key).
+struct AnimKey {
+    float t = 0;
+    v3 pos{0, 0, 0}, look{0, 0, 0};
+};
+
+static bool loadAnim(const std::string& path, std::vector<AnimKey>& keys) {
+    std::ifstream f(path);
+    if (!f) { fprintf(stderr, "cannot open anim %s\n", path.c_str()); return false; }
+    std::string line;
+    while (std::getline(f, line)) {
+        size_t h = line.find('#');
+        if (h != std::string::npos) line.resize(h);
+        std::istringstream ss(line);
+        AnimKey k{};
+        if (ss >> k.t >> k.pos.x >> k.pos.y >> k.pos.z >> k.look.x >> k.look.y >> k.look.z) keys.push_back(k);
+        else {
+            std::string first;
+            std::istringstream probe(line);
+            if (probe >> first) fprintf(stderr, "bad anim line: %s\n", line.c_str());
+        }
+    }
+    if (keys.size() < 2) { fprintf(stderr, "anim needs at least 2 keyframes\n"); return false; }
+    for (size_t i = 1; i < keys.size(); ++i)
+        if (keys[i].t <= keys[i - 1].t) { fprintf(stderr, "anim times must be increasing\n"); return false; }
+    return true;
+}
+
+static v3 crSpline(const v3& p0, const v3& p1, const v3& p2, const v3& p3, float u) {
+    float u2 = u * u, u3 = u2 * u;
+    return 0.5f * ((2.0f * p1) + (p2 - p0) * u + (p0 * 2.0f - p1 * 5.0f + p2 * 4.0f - p3) * u2 +
+                   (p0 * -1.0f + p1 * 3.0f - p2 * 3.0f + p3) * u3);
+}
+
 // ------------------------------------------------------- BVH (binned SAH) build
 struct BVHBuilder {
     std::vector<GPUTri> tris;
@@ -426,7 +468,7 @@ static void pngChunk(FILE* f, const char* type, const uint8_t* data, uint32_t ln
     if (ln2) crc = (uint32_t)crc32(crc, data, ln2);
     be32(f, crc);
 }
-static bool writePNG(const char* path, int w, int h, const uint8_t* rgba) {
+static bool writePNG(const char* path, int w, int h, const uint8_t* rgba, int level = 6) {
     std::vector<uint8_t> raw((size_t)h * (1 + (size_t)w * 4));
     for (int y = 0; y < h; ++y) {
         raw[(size_t)y * (1 + (size_t)w * 4)] = 0;
@@ -434,7 +476,7 @@ static bool writePNG(const char* path, int w, int h, const uint8_t* rgba) {
     }
     uLongf compSz = compressBound(raw.size());
     std::vector<uint8_t> comp(compSz);
-    if (compress2(comp.data(), &compSz, raw.data(), (uLong)raw.size(), 6) != Z_OK) return false;
+    if (compress2(comp.data(), &compSz, raw.data(), (uLong)raw.size(), level) != Z_OK) return false;
     comp.resize(compSz);
     FILE* f = fopen(path, "wb");
     if (!f) return false;
@@ -515,6 +557,21 @@ struct App {
     bool scrollMoved = false;  // zoom must restart accumulation too (no ghosting)
     float yaw = 0.0f, pitch = 0.02f, dist = 8.0f;  // 8.0 + fov45: box ~65% frame width, full height
     v3 target{0.0f, 2.5f, 0.0f};
+
+    // camera decoupled from input policy: the orbit params above are ONE way to
+    // produce a view; setView() installs any external (pos, look) — animations,
+    // scripted cameras and future embedders use the same single code path.
+    bool freeCam = false;
+    v3 freePos{0, 0, 0}, freeLook{0, 0, 0};
+    float fovDeg = 45.0f;
+    void setView(v3 pos, v3 look) { freePos = pos; freeLook = look; freeCam = true; }
+
+    // animation (--anim): keyframed camera -> PNG frame sequence
+    std::string animPath, animOut = "anim";
+    int animFps = 30, animSpp = 128;
+    std::vector<AnimKey> animKeys;
+    bool fast = false;    // --fast: 1 spp, no denoise, quick PNGs (motion preview)
+    int pngLevel = 6;     // zlib effort per PNG (fast mode uses 1)
 
     // ------------------------------------------------------------- helpers
     uint32_t findMemory(uint32_t typeBits, VkMemoryPropertyFlags props) {
@@ -1180,9 +1237,17 @@ struct App {
     }
 
     // ------------------------------------------------------------- camera / UBO
+    // One basis builder for every camera source (orbit input, free view).
     void updateUBO() {
-        v3 pos = target + dist * v3{std::cos(pitch) * std::sin(yaw), std::sin(pitch), std::cos(pitch) * std::cos(yaw)};
-        v3 fwd = norm(target - pos);
+        v3 pos, look;
+        if (freeCam) {
+            pos = freePos;
+            look = freeLook;
+        } else {
+            pos = target + dist * v3{std::cos(pitch) * std::sin(yaw), std::sin(pitch), std::cos(pitch) * std::cos(yaw)};
+            look = target;
+        }
+        v3 fwd = norm(look - pos);
         v3 right = norm(cross(fwd, v3{0, 1, 0}));
         v3 up = cross(right, fwd);
         UBOData u{};
@@ -1193,8 +1258,22 @@ struct App {
         u.res[0] = (float)iw;
         u.res[1] = (float)ih;
         u.res[2] = (float)frame;
-        u.res[3] = std::tan(45.0f * 3.14159265f / 180.0f * 0.5f);  // 45 deg fov
+        u.res[3] = std::tan(fovDeg * 3.14159265f / 180.0f * 0.5f);
         memcpy(uboMapped, &u, sizeof(u));
+    }
+
+    // Catmull-Rom evaluation of the keyframe track at time t (clamped to range)
+    void evalAnim(float t, v3& pos, v3& look) const {
+        const std::vector<AnimKey>& k = animKeys;
+        t = std::max(k.front().t, std::min(k.back().t, t));
+        size_t i = k.size() - 2;
+        for (size_t j = 0; j + 1 < k.size(); ++j)
+            if (t >= k[j].t && t <= k[j + 1].t) { i = j; break; }
+        float span = k[i + 1].t - k[i].t;
+        float u = span > 1e-6f ? (t - k[i].t) / span : 0.0f;
+        auto P = [&](int j) -> const AnimKey& { return k[std::max(0, std::min((int)k.size() - 1, j))]; };
+        pos = crSpline(P((int)i - 1).pos, P((int)i).pos, P((int)i + 1).pos, P((int)i + 2).pos, u);
+        look = crSpline(P((int)i - 1).look, P((int)i).look, P((int)i + 1).look, P((int)i + 2).look, u);
     }
 
     // offline denoise (5 à-trous iterations) + finalize into the display image
@@ -1244,23 +1323,22 @@ struct App {
         submitWait(cmd);
         void* p = nullptr;
         VKCHECK(vkMapMemory(device, rm, 0, VK_WHOLE_SIZE, 0, &p));
-        writePNG(path, iw, ih, (const uint8_t*)p);
+        writePNG(path, iw, ih, (const uint8_t*)p, pngLevel);
         vkUnmapMemory(device, rm);
         vkDestroyBuffer(device, rb, nullptr);
         vkFreeMemory(device, rm, nullptr);
     }
 
-    // high-quality still from the CURRENT camera (called by the P key):
-    // re-accumulates from scratch for `frames` spp, writes a noise-free PNG
-    void snapshotToPNG(const char* path, int frames) {
-        printf("snapshot: rendering %d spp at %dx%d (window will pause)...\n", frames, iw, ih);
+    // shared render core: "accumulate N spp from the CURRENT camera, denoise,
+    // write a PNG" — the one entry point behind snapshots, offscreen and anim.
+    void renderStill(const char* path, int frames, bool progress) {
         auto t0 = std::chrono::steady_clock::now();
         for (int f = 0; f < frames; ++f) {
             frame = f;
             updateUBO();
             recordFrame(~0u, false);
             submitWait(cmd);
-            if ((f & 127) == 127) {
+            if (progress && (f & 127) == 127) {
                 double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 printf("  %d/%d (%.0fs elapsed, ~%.0fs left)\n", f + 1, frames, el,
                        el / (f + 1) * (frames - f - 1));
@@ -1268,8 +1346,62 @@ struct App {
         }
         runDenoiseFinalize();   // overwrites the display image with the filtered result
         readbackPNG(path);
+    }
+
+    // high-quality still from the CURRENT camera (called by the P key):
+    // re-accumulates from scratch for `frames` spp, writes a noise-free PNG
+    void snapshotToPNG(const char* path, int frames) {
+        printf("snapshot: rendering %d spp at %dx%d (window will pause)...\n", frames, iw, ih);
+        auto t0 = std::chrono::steady_clock::now();
+        renderStill(path, frames, true);
         double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         printf("snapshot: wrote %s (%d spp%s, %.1fs)\n", path, frames, denoise ? ", denoised" : "", el);
+    }
+
+    // blit the display image to a swapchain image WITHOUT tracing — used to
+    // show finished/denoised animation frames in the preview window
+    void recordBlitOnly(uint32_t swapIdx) {
+        VKCHECK(vkResetCommandBuffer(cmd, 0));
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VKCHECK(vkBeginCommandBuffer(cmd, &bi));
+        VkImageMemoryBarrier pre[2]{};
+        pre[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        pre[0].image = displayImage;
+        pre[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        pre[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        pre[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        pre[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        pre[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        pre[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        pre[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        pre[1] = pre[0];
+        pre[1].image = swapImages[swapIdx];
+        pre[1].srcAccessMask = 0;
+        pre[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        pre[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        pre[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                             0, nullptr, 0, nullptr, 2, pre);
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[1] = {iw, ih, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.dstOffsets[1] = {(int32_t)winW, (int32_t)winH, 1};
+        vkCmdBlitImage(cmd, displayImage, VK_IMAGE_LAYOUT_GENERAL, swapImages[swapIdx],
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        VkImageMemoryBarrier post{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        post.image = swapImages[swapIdx];
+        post.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        post.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        post.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        post.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        post.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        post.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        post.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                             0, nullptr, 0, nullptr, 1, &post);
+        VKCHECK(vkEndCommandBuffer(cmd));
     }
 
     // ------------------------------------------------------------- offscreen
@@ -1375,6 +1507,157 @@ struct App {
             destroySwapchain();
             vkDestroySurfaceKHR(instance, surface, nullptr);
             surface = VK_NULL_HANDLE;
+            glfwDestroyWindow(window);
+            window = nullptr;
+        }
+        return 0;
+    }
+
+    // ------------------------------------------------------------- animation
+    // Renders a keyframed camera fly-through to a PNG sequence. Every output
+    // frame is an independent converged still: setView() from the spline,
+    // animSpp samples re-accumulated from scratch, denoise, readback. On
+    // desktop a live preview window shows each frame while it converges.
+    int runAnim() {
+        if (animKeys.size() < 2) { fprintf(stderr, "no animation loaded\n"); return 1; }
+        bool preview = false;
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        window = glfwCreateWindow(winW, winH, "animation render", nullptr, nullptr);
+        if (window) {
+            glfwGetFramebufferSize(window, &winW, &winH);
+            glfwPollEvents();
+            VkResult rc = glfwCreateWindowSurface(instance, window, nullptr, &surface);
+            if (rc != VK_SUCCESS) {
+                glfwPollEvents();
+                rc = glfwCreateWindowSurface(instance, window, nullptr, &surface);
+            }
+            if (rc == VK_SUCCESS) {
+                createSwapchain();
+                preview = true;
+            } else {
+                fprintf(stderr, "note: surface creation failed (%d), rendering headless\n", (int)rc);
+                surface = VK_NULL_HANDLE;
+            }
+        } else {
+            fprintf(stderr, "note: no window, rendering headless\n");
+        }
+
+        // present the current display image; blitOnly=false also runs the 1 spp
+        // dispatch for sample f (the preview pass doubles as a sample). Returns
+        // false once the user closes the window (= cancel the render).
+        // Self-contained synchronization: the GPU is always idle here (all
+        // rendering went through submitWait), so we only wait for our own
+        // submit at the end — never on a stale fence. Repeated acquire
+        // timeouts mean the window is hidden/occluded (macOS stops delivering
+        // drawables): back off and continue headless instead of stalling.
+        int previewMisses = 0;
+        auto presentPreview = [&](bool blitOnly, const char* title) -> bool {
+            glfwPollEvents();
+            if (glfwWindowShouldClose(window)) return false;
+            uint32_t idx = 0;
+            VkResult acq = vkAcquireNextImageKHR(device, swapchain, 1000000000ull, semAcquire, VK_NULL_HANDLE, &idx);
+            if (acq == VK_SUCCESS || acq == VK_SUBOPTIMAL_KHR) {
+                previewMisses = 0;
+                if (blitOnly) recordBlitOnly(idx);
+                else recordFrame(idx, true);
+                VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                si.waitSemaphoreCount = 1;
+                si.pWaitSemaphores = &semAcquire;
+                si.pWaitDstStageMask = &waitStage;
+                si.commandBufferCount = 1;
+                si.pCommandBuffers = &cmd;
+                si.signalSemaphoreCount = 1;
+                si.pSignalSemaphores = &semRender;
+                VKCHECK(vkQueueSubmit(queue, 1, &si, fence));
+                VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+                pi.waitSemaphoreCount = 1;
+                pi.pWaitSemaphores = &semRender;
+                pi.swapchainCount = 1;
+                pi.pSwapchains = &swapchain;
+                pi.pImageIndices = &idx;
+                vkQueuePresentKHR(queue, &pi);
+                VKCHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
+                VKCHECK(vkResetFences(device, 1, &fence));
+            } else if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
+                vkDeviceWaitIdle(device);
+                destroySwapchain();
+                createSwapchain();
+            } else if (acq == VK_TIMEOUT || acq == VK_NOT_READY) {
+                if (++previewMisses >= 4 && preview) {
+                    printf("note: preview window not visible — continuing headless\n");
+                    preview = false;
+                }
+                if (!blitOnly) {   // the sample still has to happen
+                    recordFrame(~0u, false);
+                    submitWait(cmd);
+                }
+            } else {
+                VKCHECK(acq);
+            }
+            if (preview) glfwSetWindowTitle(window, title);
+            return true;
+        };
+
+        std::filesystem::create_directories(animOut);
+        float dur = animKeys.back().t;
+        int total = (int)std::floor(dur * animFps) + 1;
+        printf("anim: %.1fs @ %dfps = %d frames x %d spp @ %dx%d -> %s/frame_%04d.png%s\n",
+               dur, animFps, total, animSpp, iw, ih, animOut.c_str(), total - 1,
+               fast ? "  [FAST: 1 spp, no denoise — motion preview only]" : "");
+        auto t0 = std::chrono::steady_clock::now();
+        char title[160];
+
+        int done = 0;
+        bool aborted = false;
+        for (int i = 0; i < total && !aborted; ++i) {
+            float t = i / (float)animFps;
+            v3 pos, look;
+            evalAnim(t, pos, look);
+            setView(pos, look);
+            for (int f = 0; f < animSpp; ++f) {
+                frame = f;
+                updateUBO();
+                if (preview && f % 32 == 31) {
+                    snprintf(title, sizeof(title), "anim %d/%d @ t=%.2fs | %d/%d spp", i, total - 1, t, f + 1, animSpp);
+                    if (!presentPreview(false, title)) {
+                        printf("preview window closed — stopping (%d/%d frames done)\n", done, total);
+                        aborted = true;
+                        break;
+                    }
+                } else {
+                    recordFrame(~0u, false);
+                    submitWait(cmd);
+                }
+            }
+            if (aborted) break;
+            runDenoiseFinalize();
+            char nm[600];
+            snprintf(nm, sizeof(nm), "%s/frame_%04d.png", animOut.c_str(), i);
+            readbackPNG(nm);
+            ++done;
+            if (preview) {
+                snprintf(title, sizeof(title), "anim %d/%d @ t=%.2fs | written", i, total - 1, t);
+                if (!presentPreview(true, title)) preview = false;   // keep rendering headless
+            }
+            if ((i & 7) == 7 || i == total - 1) {
+                double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                printf("  frame %d/%d (%.0fs elapsed, ~%.0fs left)\n", i + 1, total, el,
+                       el / done * (total - done));
+            }
+        }
+        double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        printf("anim: %d frames in %.1fs (%.2fs/frame, %.1f Mpaths/s)%s\n", done, sec, sec / std::max(1, done),
+               (double)iw * ih * done * animSpp / sec / 1e6, denoise ? ", denoised" : "");
+        printf("encode with: ffmpeg -framerate %d -i %s/frame_%%04d.png -c:v libx264 -pix_fmt yuv420p -crf 18 anim.mp4\n",
+               animFps, animOut.c_str());
+        if (window) {
+            vkDeviceWaitIdle(device);
+            if (swapchain) destroySwapchain();
+            if (surface) {
+                vkDestroySurfaceKHR(instance, surface, nullptr);
+                surface = VK_NULL_HANDLE;
+            }
             glfwDestroyWindow(window);
             window = nullptr;
         }
@@ -1583,14 +1866,29 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     App app;
     int offFrames = 0;
+    bool sizeSet = false;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--offscreen")) {
             app.offscreen = true;
             offFrames = 256;
             if (i + 1 < argc && argv[i + 1][0] != '-') offFrames = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--anim") && i + 1 < argc) {
+            app.animPath = argv[++i];
+        } else if (!strcmp(argv[i], "--fast")) {
+            // anim-only: noisy 1-spp motion preview, no denoise, quick PNGs
+            app.fast = true;
+            app.animSpp = 1;
+            app.denoise = false;
+            app.pngLevel = 1;
+        } else if (!strcmp(argv[i], "--fps") && i + 1 < argc) {
+            app.animFps = std::max(1, atoi(argv[++i]));
+        } else if (!strcmp(argv[i], "--spp") && i + 1 < argc) {
+            app.animSpp = std::max(1, atoi(argv[++i]));
+        } else if (!strcmp(argv[i], "--out") && i + 1 < argc) {
+            app.animOut = argv[++i];
         } else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
             sscanf(argv[++i], "%dx%d", &app.winW, &app.winH);
-            if (app.offscreen) { app.iw = app.winW; app.ih = app.winH; }
+            sizeSet = true;
         } else if (!strcmp(argv[i], "--ires") && i + 1 < argc) {
             sscanf(argv[++i], "%dx%d", &app.iw, &app.ih);
         } else if (!strcmp(argv[i], "--scene") && i + 1 < argc) {
@@ -1606,8 +1904,17 @@ int main(int argc, char** argv) {
         }
     }
     if (app.offscreen && offFrames <= 0) offFrames = 256;
+    // --size means "output size" in every non-interactive mode (order-independent)
+    if (sizeSet && (app.offscreen || !app.animPath.empty())) {
+        app.iw = app.winW;
+        app.ih = app.winH;
+    }
 
     app.buildWorld();
     app.initVulkan();
+    if (!app.animPath.empty()) {
+        if (!loadAnim(app.animPath, app.animKeys)) return 1;
+        return app.runAnim();
+    }
     return app.offscreen ? app.runOffscreen(offFrames) : app.runWindowed();
 }

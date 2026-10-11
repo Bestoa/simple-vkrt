@@ -15,3 +15,6 @@ snapshot.png
 
 # Vulkan tools
 vkconfig-*.json
+
+# animation frame sequences (regenerable)
+anim/
